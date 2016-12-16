@@ -22,112 +22,491 @@
  * 02111-1307, USA.
  *)
 
-(** Module [Lwt]: cooperative light-weight threads. *)
+(* TODO Link to some tutorial once it exists? *)
+(** Promises.
 
-(** This module defines {e cooperative light-weight threads} with
-    their primitives. A {e light-weight thread} represent a
-    computation that may be not terminated, for example because it is
-    waiting for some event to happen.
+    This module defines {e promises}: values that may become determined in the
+    future. A promise that can become determined with values of type ['a] has
+    type ['a Lwt.t]. A promise is always in one of three states:
 
-    Lwt threads are cooperative in the sense that switching to another
-    thread is always explicit (with {!wakeup} or {!wakeup_exn}). When a
-    thread is running, it executes as much as possible, and then
-    returns (a value or an error) or sleeps.
+    - {e resolved}, and containing a read-only value of type ['a],
+    - {e failed}, and containing a read-only exception (of type [exn]), or
+    - {e pending}, in which case it may become resolved or failed in the future.
 
-    Note that inside a Lwt thread, exceptions must be raised with
-    {!fail} instead of [raise]. Also the [try ... with ...]
-    construction will not catch Lwt errors. You must use {!catch}
-    instead. You can also use {!wrap} for functions that may raise
-    normal exception.
+    Many functions in Lwt create promises. For example, {!Lwt_unix.write} starts
+    a concurrent [write] system call in the background, and gives you a promise
+    that will resolve when that system call completes. You can get the result by
+    waiting on the promise with the [let%lwt] construct:
 
-    Lwt also provides the syntax extension {!Pa_lwt} to make code
-    using Lwt more readable.
-*)
+{[
+let () =
+  Lwt_main.run begin
+    let%lwt bytes_written =
+      Lwt_unix.write Lwt_unix.stdout "Hello! " 0 (Bytes.length "Hello! ") in
+    let%lwt () = Lwt_io.printf "Wrote %i bytes!\n" bytes_written in
+    Lwt.return_unit
+  end
+  (* ocamlfind opt -linkpkg -package lwt.unix -package lwt.ppx example.ml *)
+]}
 
-(** {2 Definitions and basics} *)
+   That prints: {v Hello! Wrote 7 bytes! v} The surrounding call to
+   {!Lwt_main.run} drives the Lwt code and forces it to run to completion.
+   Without {!Lwt_main.run}, the program would create several promises, but then
+   exit immediately without waiting for any of them. You call {!Lwt_main.run}
+   once, at the top level of your program, if you are targeting a Unix or
+   Windows system, but it is not necessary when compiling to JavaScript. *)
+
+
+
+(** {2 Basics} *)
 
 type +'a t
-  (** The type of threads returning a result of type ['a]. *)
+(** Promises that resolve with values of type ['a]. *)
+
+type -'a u
+(** Resolvers for promises of type ['a t]. *)
+
+(** {3 Creating} *)
+
+val wait : unit -> 'a t * 'a u
+(** [Lwt.wait ()] gives a pair [(promise, resolver)]. The promise is pending
+    until something calls [Lwt.wakeup_later resolver v], at which point the
+    promise is resolved with [v]. It is also possible to fail the promise with
+    [exn] by calling [Lwt.wakeup_later_exn resolver exn]. Promises created with
+    [Lwt.wait] cannot be canceled; see {!Lwt.task} for cancelable promises.
+
+    In ordinary, high-level usage of Lwt, you call Lwt functions other than
+    [Lwt.wait] to get interesting promises. However, those functions internally
+    use [Lwt.wait] or {!Lwt.task}. They start some background work, return the
+    new promise immediately, and hold on to the resolver. When the work is
+    finished, they use the resolver to resolve the promise.
+
+    Sometimes, you need to create a promise directly on your own. As a simple
+    example, here is an overly elaborate way to pass around [42]:
+
+{[
+let () =
+  let promise, resolver = Lwt.wait () in
+  let wait_for_resolve =
+    let%lwt answer = promise in
+    let%lwt () = Lwt_io.printf "The answer is: %i\n" answer in
+    Lwt.return_unit
+  in
+  Lwt.wakeup_later resolver 42;   (* Resolve the promise. *)
+  Lwt_main.run wait_for_resolve
+(* ocamlfind opt -linkpkg -package lwt.unix -package lwt.ppx example.ml *)
+]} *)
+
+(** {3 Resolving} *)
+
+val wakeup_later : 'a u -> 'a -> unit
+(** [Lwt.wakeup_later resolver v] resolves the promise associated with
+    [resolver] with the value [v]. See {!Lwt.wait}.
+
+    A promise can only be resolved once. Calling [Lwt.wakeup_later], or related
+    functions, more than once on the same resolver raises [Invalid_argument]. *)
+
+val wakeup_later_exn : 'a u -> exn -> unit
+(** Like {!Lwt.wakeup_later}, but fails the promise with the given exception
+    instead. *)
+
+(** {3 Waiting} *)
+
+(* TODO Backtraces. *)
+val bind : 'a t -> ('a -> 'b t) -> 'b t
+(** [Lwt.bind promise then_] schedules [then_] to be called when [promise]
+    resolves. [Lwt.bind] immediately evaluates to [promise'], which is resolved
+    as follows:
+
+    - First, [promise'] waits for [promise]. If [promise] fails with [exn],
+      [promise'] also fails with [exn], and [then_] is never called.
+    - If [promise] resolves successfully with value [v], [then_ v] is called. If
+      either that call, or the promise it returns, fail with [exn], [promise']
+      fails with [exn] as well.
+    - If the promise [then_ v] resolves successfully with [v'], [promise']
+      resolves with [v'].
+    - Note that this behavior is the same even if [promise] has already resolved
+      or failed.
+
+    [Lwt.bind] is Lwt's basic sequencing operation. It is how you cause code to
+    run in the future. However, a sequence of calls to [Lwt.bind] is a bit
+    awkward to maintain when used directly, because of the need to balance
+    parentheses. For this reason, Lwt provides the [let%lwt] construct, which
+    is pronounced "bind" and desugars to [Lwt.bind]:
+
+{[
+let () =
+  Lwt_main.run begin
+    let%lwt () = Lwt_unix.sleep 5. in
+    let%lwt () =
+      Lwt_io.printl "Slept 5 seconds more than the author of this manual." in
+    Lwt.return_unit
+  end
+(* ocamlfind opt -linkpkg -package lwt.unix -package lwt.ppx example.ml *)
+]}
+
+    That desugars to:
+
+{[
+let () =
+  Lwt_main.run begin
+    Lwt.bind (Lwt_unix.sleep 5.) (fun () ->
+    Lwt.bind
+      (Lwt_io.printl "Slept 5 seconds more than the author of this manual.")
+      (fun () ->
+    Lwt.return_unit))   (* <-- those parens will get annoying. *)
+  end
+(* ocamlfind opt -linkpkg -package lwt.unix example.ml *)
+]}
+
+    [let%lwt] is the recommended way to write Lwt code. It requires package
+    [lwt.ppx]. An alternative syntactic sugar for [Lwt.bind] is the infix
+    operator {!Lwt.(>>=)}:
+
+{[
+open Lwt.Infix
+let () =
+  Lwt_main.run begin
+    Lwt_unix.sleep 5. >>= fun () ->
+    Lwt_io.printl
+      "Slept 5 seconds more than the author of this manual." >>= fun () ->
+    Lwt.return_unit
+  end
+(* ocamlfind opt -linkpkg -package lwt.unix example.ml *)
+]}
+
+    It is normal to schedule multiple [then_] functions on a single promise.
+    They will all be called when the promise resolves, in some arbitrary
+    order. Here is a simple "fork-join" with Lwt:
+
+{[
+let () =
+  Lwt_main.run begin
+    let sleeping = Lwt_unix.sleep 5. in
+    let waiting_1 =
+      let%lwt () = sleeping in
+      let%lwt () = Lwt_io.printl "Will this run first?" in
+      Lwt.return_unit
+    in
+    let waiting_2 =
+      let%lwt () = sleeping in
+      let%lwt () = Lwt_io.printl "Or this?" in
+      Lwt.return_unit
+    in
+    Lwt.join [waiting_1; waiting_2]
+  end
+(* ocamlfind opt -linkpkg -package lwt.unix -package lwt.ppx example.ml *)
+]}
+
+    The {!Lwt.join} just waits for both promises to resolve.
+
+ *)
+
+(** {3 Trivial promises} *)
 
 val return : 'a -> 'a t
-  (** [return e] is a thread whose return value is the value of the
-      expression [e]. *)
+(** Creates a promise that has already resolved with the given value.
 
+    This function is used mostly for satisfying the type system: when a promise
+    is expected, but you have a regular value, apply [Lwt.return] to wrap it. A
+    typical scenario is wrapping a value at the end of a {!Lwt.bind}, a.k.a.
+    [let%lwt], because the [then_] function has to evaluate to a promise:
+
+{[
+let () =
+  Lwt_main.run begin
+    let%lwt bytes_written =
+      Lwt_unix.(write stdout) "Hello " 0 (Bytes.length "Hello ") in
+    let%lwt bytes_written' =
+      Lwt_unix.(write stdout) "world!" 0 (Bytes.length "world!") in
+    Lwt.return (bytes_written + bytes_written')
+  end
+  |> Printf.printf "\nWrote %i bytes!\n"
+(* ocamlfind opt -linkpkg -package lwt.unix -package lwt.ppx example.ml *)
+]}
+
+    Where performance matters, some allocations can be saved by using
+    {{:#3_Preallocatedpromises} pre-allocated promises}. A future version of Lwt
+    might make this unnecessary by performing the optimization automatically.
+
+    Note that an expression like [Lwt.return (compute ())] does not create a
+    promise that "waits for" [compute ()]. Instead, it first runs [compute ()]
+    to completion, and only then wraps its result in an already-resolved
+    promise. This expression is therefore pointless:
+
+{[
+let%lwt result = Lwt.return (compute ()) in
+(* do something with result *)
+]}
+
+    and can be reduced to:
+
+{[
+let result = compute () in
+(* do something with result *)
+]}
+
+    For creating unresolved promises that {e are} pending on something, see
+    {!Lwt.wait} and {!Lwt.task}. *)
+
+(* TODO Add note about how to raise exceptions in Lwt. *)
+(* TODO Link to exception handling. *)
 val fail : exn -> 'a t
-  (** [fail e] is a thread that fails with the exception [e]. *)
+(** Creates a promise that has already failed with the given exception. This is
+    analogous to {!Lwt.return}. *)
 
-val fail_with : string -> 'a t
-  (** [fail_with msg] is a thread that fails with the exception
-      [Failure msg]. *)
 
-val fail_invalid_arg : string -> 'a t
-  (** [fail_invalid_arg msg] is a thread that fails with the exception
-      [Invalid_argument msg]. *)
 
-val bind : 'a t -> ('a -> 'b t) -> 'b t
-  (** [bind t f] is a thread which first waits for the thread [t] to
-      terminate and then, if the thread succeeds, behaves as the
-      application of function [f] to the return value of [t].  If the
-      thread [t] fails, [bind t f] also fails, with the same
-      exception.
+(** {2 Exceptions} *)
 
-      The expression [bind t (fun x -> t')] can intuitively be read as
-      [let x = t in t'], and if you use the {e lwt.syntax} syntax
-      extension, you can write a bind operation like that: [lwt x = t in t'].
+(* TODO Note syntax. *)
+(* TODO Warn about using regular try. *)
+val catch : (unit -> 'a t) -> (exn -> 'a t) -> 'a t
+(** [Lwt.catch f handler] tries to resolve the promise [f ()], and runs
+    [handler exn] if [f ()] fails. In more detail, it evaluates to [promise],
+    which is resolved as follows:
 
-      Note that [bind] is also often used just for synchronization
-      purpose: [t'] will not execute before [t] is terminated.
+    - If applying [f ()] results in a promise, and that promise resolves with
+      value [v], then the outer [promise] resolves with [v] as well.
+    - If applying [f ()] raises [exn], or results in a promise, but that promise
+      fails with [exn], then [handler exn] is applied.
+    - If [handler exn] raises [exn'], or results in a promise, and that promise
+      fails with [exn'], the outer [promise] fails with [exn'].
+    - Otherwise, if [handler exn] results in a promise, and that promise
+      resolves with value [v'], the outer promise resolves with [v'].
 
-      The result of a thread can be bound several times.
+    This function is typically written using the [try%lwt] syntax:
 
-      Note that [bind] will not propagate backtraces correctly.
-      See {{:http://ocsigen.org/lwt/manual/} the manual}
-      for how to enable backtraces.
-  *)
+{[
+let () =
+  Lwt_main.run begin
+    try%lwt
+      let%lwt () = Lwt_io.printl "About to fail!" in
+      raise (Failure "no reason")
+    with Failure reason ->
+      let%lwt () = Lwt_io.printf "Failed for %s" reason in
+      Lwt.return_unit
+  end
+(* ocamlfind opt -linkpkg -package lwt.unix -package lwt.ppx example.ml *)
+]}
 
-val (>>=) : 'a t -> ('a -> 'b t) -> 'b t
-  (** [t >>= f] is an alternative notation for [bind t f]. *)
+    That desugars to:
 
-val (=<<) : ('a -> 'b t) -> 'a t -> 'b t
-  (** [f =<< t] is [t >>= f] *)
+{[
+let () =
+  Lwt_main.run begin
+    Lwt.catch
+      (fun () ->
+        let%lwt () = Lwt_io.printl "About to fail!" in
+        raise (Failure "no reason")
+      (function
+        | Failure reason ->
+          let%lwt () = Lwt_io.printf "Failed for %s" reason in
+          Lwt.return_unit
+        | exn -> Lwt.fail exn)
+  end
+(* ocamlfind opt -linkpkg -package lwt.unix -package lwt.ppx example.ml *)
+]}
 
-val map : ('a -> 'b) -> 'a t -> 'b t
-  (** [map f m] maps the result of a thread. This is the same as [bind
-      m (fun x -> return (f x))] *)
+    It is important not to use the ordinary [try] to handle exceptions raised
+    while a promise is being resolved. Let's take a program similar to the first
+    example, but replace [try%lwt] with [try], and consider what would happen:
 
-val (>|=) : 'a t -> ('a -> 'b) -> 'b t
-  (** [m >|= f] is [map f m] *)
+{[
+let () =
+  Lwt_main.run begin
+    try
+      let%lwt () = Lwt_unix.sleep 1. in
+      raise (Failure "no reason")
+    with Failure reason ->
+      let%lwt () = Lwt_io.printf "Failed for %s." reason in
+      Lwt.return_unit
+  end
+(* ocamlfind opt -linkpkg -package lwt.unix -package lwt.ppx example.ml *)
+]}
 
-val (=|<) : ('a -> 'b) -> 'a t -> 'b t
-  (** [f =|< m] is [map f m] *)
+    The first thing this program does is evaluate [Lwt_unix.sleep 1.]. That
+    creates a pending promise. The [let%lwt () = ... in] wraps that in another
+    pending promise [p], which will fail {e later}, once the [sleep] resolves.
+    No exception occurrs while {e creating} [p], so the [try] evaluates to [p],
+    and is dismissed. [p] is passed to {!Lwt_main.run}, which runs it to
+    completion. [p] fails after one second, but, because there is no handler,
+    the failure aborts the program, instead of printing
+    ["Failed for no reason."].
 
-(** {3 Pre-allocated threads} *)
+    You can replace the [try] with [try%lwt], and the program will have the
+    expected behavior. The general rule is: [try] is for exceptions raised while
+    promises are being created, and [try%lwt] is for exceptions raised while
+    promises are being created or resolved. You almost always want the
+    latter. *)
 
-val return_unit : unit t
-  (** [return_unit = return ()] *)
+(* TODO What happens if after fails? *)
+val finalize : (unit -> 'a t) -> (unit -> unit t) -> 'a t
+(** [Lwt.finalize f then_] resolves [f ()], then resolves [then_] no matter
+    whether [f ()] resolves or fails. In more detail, it evaluates to [promise],
+    which is resolved as follows:
 
-val return_none : 'a option t
-  (** [return_none = return None] *)
+    - If applying [f ()] results in a promise, and that promise resolves with
+      value [v], and [then_ ()] also resolves, [promise] resolves with [v].
+    - If applying [f ()] raises [exn], or results in a promise, and that promise
+      fails with [exn], and [then_ ()] resolves, [promise] fails with [exn].
+    - No matter the behavior of [f ()], if [then_ ()] raises [exn'] or results
+      in a promise, but the promise fails with [exn'], [promise] fails with
+      [exn'].
 
-val return_some : 'a -> 'a option t
-  (** [return_some x = return (Some x)] *)
+    This function can be used with the [[%finally]] syntax:
 
-val return_nil : 'a list t
-  (** [return_nil = return \[\]] *)
+{[
+let () =
+  Lwt_main.run begin
+    Random.self_init ();
+    (if Random.bool () then raise (Failure "Bad luck!") else Lwt.return_unit)
+    [%finally Lwt_io.printl "This always runs."]
+  end
+(* ocamlfind opt -linkpkg -package lwt.unix -package lwt.ppx example.ml *)
+]}
 
-val return_true : bool t
-  (** [return_true = return true] *)
+    That desugars to:
 
-val return_false : bool t
-  (** [return_false = return false] *)
+{[
+let () =
+  Lwt_main.run begin
+    Random.self_init ();
+    Lwt.finalize
+      (fun () ->
+        if Random.bool () then raise (Failure "Bad luck!") else Lwt.return_unit)
+      (fun () -> Lwt_io.printl "This always runs.")
+  end
+(* ocamlfind opt -linkpkg -package lwt.unix -package example.ml *)
+]} *)
 
-val return_ok : 'a -> ('a, _) Result.result t
-  (** [return_ok x] is equivalent to [return (Ok x)].
-      @since 2.6.0 *)
 
-val return_error : 'e -> (_, 'e) Result.result t
-  (** [return_error x] is equivalent to [return (Error x)].
-      @since 2.6.0 *)
+
+(** {2 Concurrency} *)
+
+val async : (unit -> 'a t) -> unit
+(** [Lwt.async f] applies [f ()], and adds the resulting promise to Lwt's
+    internal scheduler. This basically "forks" a "task" that you cannot wait on.
+    The promise [f ()] doesn't have to resolve: it might be an infinite loop.
+
+    For example, this will print nonsense about five times:
+
+{[
+let () =
+  Lwt_main.run begin
+    Lwt.async begin fun () ->
+      let rec loop () =
+        let%lwt () = Lwt_io.printl "Nananana..." in
+        let%lwt () = Lwt_unix.sleep 1. in
+        loop ()
+      in
+      loop ()
+    end;
+    let%lwt () = Lwt_unix.sleep 4.5 in
+    Lwt.return_unit
+  end
+(* ocamlfind opt -linkpkg -package lwt.unix -package lwt.ppx example.ml *)
+]}
+
+    If [f ()] raises an exception, or the promise [f ()] fails, that is a
+    programming error, because there is no graceful way for the program to
+    handle the exception: the exception has nowhere to go. It is passed to
+    {!Lwt.async_exception_hook}, which terminates the program by default.
+
+    Note that the promise [f ()] is run concurrently, but not in parallel, with
+    the code that called [Lwt.async]. Unless [f ()] or the calling code do I/O,
+    multitasking between them is cooperative, and both are run in a single
+    system thread. For running code in multiple threads, see module
+    {!Lwt_preemptive}. Note further, however, that current versions of OCaml
+    don't allow multiple system threads to run OCaml code in parallel. However,
+    two threads can run code in parallel if at least one of them calls C code
+    and releases the OCaml runtime lock. *)
+
+(* TODO What was that about storage unchanged? *)
+val join : unit t list -> unit t
+(** [Lwt.join promises] waits for all [promises] to resolve or fail. Then, if
+    all promises resolve, [Lwt.join promises] resolves with [()]. Otherwise, if
+    at least one promise fails, [Lwt.join promises] fails with the same
+    exception as the first promise to fail. If two or more promises had already
+    failed when passed to [Lwt.join], [Lwt.join promises] chooses one
+    arbitrarily to be the first.
+
+{[
+let () =
+  Lwt_main.run begin
+    let sleep_1 =
+      let%lwt () = Lwt_io.print "This program sleeps only 1 second: " in
+      let%lwt () = Lwt_unix.sleep 1. in
+      Lwt.return_unit
+    in
+    let sleep_2 =
+      let%lwt () = Lwt_io.printl "the promises are resolved in parallel." in
+      let%lwt () = Lwt_unix.sleep 1. in
+      Lwt.return_unit
+    in
+    Lwt.join [sleep_1; sleep_2]
+  end
+(* ocamlfind opt -linkpkg -package lwt.unix -package lwt.ppx example.ml *)
+]}
+
+    Note that it is only the I/O in these two promises that is resolved in
+    parallel. All the code is run in a single OCaml thread. If both promises ran
+    only code, they would be resolved entirely in series, though in an aribtrary
+    order.
+
+    [Lwt.join [sleep_1; sleep_2]] can be written [sleep_1 <&> sleep_2], if you
+    [open Lwt.Infix]. See {!Lwt.(<&>)}. *)
+
+(* TODO What was that about storage unchanged? *)
+val choose : 'a t list -> 'a t
+(** [choose promises] waits for any promise in [promises] to resolve or fail. It
+    then resolves or fails the same as that promise. If several promises have
+    already resolved or failed when [choose] is called, one is chosen
+    arbitrarily.
+
+    [Lwt.choose [t; t']] can also be written [t <?> t'], if you
+    [open Lwt.Infix]. See {!Lwt.(<?>)}. *)
+
+(* TODO What was that about storage unchanged? *)
+(* TODO Is it really true that this fails if *any* promise in l fails? Or just
+   the ones that were seen when nchoose was called? *)
+val nchoose : 'a t list -> 'a list t
+(** [nchoose promises] is like {!Lwt.choose}, but if several promises have
+    already resolved or failed, all are returned. *)
+
+val nchoose_split : 'a t list -> ('a list * 'a t list) t
+(** [nchoose_split promises] is like {!Lwt.nchoose} but also retrurns the list
+    of promises that have not yet resolved or failed. *)
+
+val ignore_result : 'a t -> unit
+(** [ignore_result t] behaves as follows:
+
+    - if [t] has completed with a result, [ignore_result t] does nothing,
+    - if [t] has completed with an exception, [ignore_result t] raises the
+      exception,
+    - if [t] has not completed, [ignore_result t] evaluates to [()] immediately,
+      but if [t] completes later with an exception, it will be given to
+      {!async_exception_hook}.
+
+    Note that this means [ignore_result t] does not wait for [t] to complete. If
+    you need to wait, use [t >>= fun _ -> (* ...after t... *)]. *)
+
+val async_exception_hook : (exn -> unit) ref
+(** [!Lwt.async_exception_hook exn] is called when [exn] is raised by some
+    computation, but there is no promise that Lwt can fail with [exn].
+
+    The typical example is when you call [Lwt.async computation], and
+    [computation ()] raises an exception: since {!Lwt.async} does not produce a
+    promise, this exception has "nowhere to go," and is given to
+    [!Lwt.async_exception_hook].
+
+    All such situations are programming errors. The default behavior of this
+    function is to print an error message and exit the program.
+
+    If you are writing an application, you can replace this reference with
+    another function. If writing a library, you should not modify it. *)
+
+
 
 (** {2 Thread storage} *)
 
@@ -149,149 +528,7 @@ val with_value : 'a key -> 'a option -> (unit -> 'b) -> 'b
       This function should not be applied within threads created with
       {!Lwt_preemptive.detach}. *)
 
-(** {2 Exceptions handling} *)
-
-val catch : (unit -> 'a t) -> (exn -> 'a t) -> 'a t
-  (** [catch t f] is a thread that behaves as the thread [t ()] if
-      this thread succeeds.  If the thread [t ()] fails with some
-      exception, [catch t f] behaves as the application of [f] to this
-      exception. *)
-
-val try_bind : (unit -> 'a t) -> ('a -> 'b t) -> (exn -> 'b t) -> 'b t
-  (** [try_bind t f g] behaves as [bind (t ()) f] if [t] does not
-      fail.  Otherwise, it behaves as the application of [g] to the
-      exception associated to [t ()]. *)
-
-val finalize : (unit -> 'a t) -> (unit -> unit t) -> 'a t
-  (** [finalize f g] returns the same result as [f ()] whether it
-      fails or not. In both cases, [g ()] is executed after [f]. *)
-
-val wrap : (unit -> 'a) -> 'a t
-  (** [wrap f] calls [f] and transforms the result into an Lwt thread.
-      If [f] raises an exception, it is caught and converted to an Lwt
-      exception.
-
-      This is actually the same as:
-
-      {[
-        try
-          return (f ())
-        with exn ->
-          fail exn
-      ]}
-  *)
-
-val wrap1 : ('a -> 'b) -> 'a -> 'b t
-  (** [wrap1 f x] applies [f] on [x] and returns the result as a
-      thread. If the application of [f] to [x] raise an exception it
-      is catched and a thread is returned.
-
-      Note that you must use {!wrap} instead of {!wrap1} if the
-      evaluation of [x] may raise an exception.
-
-      For example, the following code is incorrect:
-
-      {[
-        wrap1 f (Hashtbl.find table key)
-      ]}
-
-      and should be written as:
-
-      {[
-        wrap (fun () -> f (Hashtbl.find table key))
-      ]}
-  *)
-
-val wrap2 : ('a -> 'b -> 'c) -> 'a -> 'b -> 'c t
-val wrap3 : ('a -> 'b -> 'c -> 'd) -> 'a -> 'b -> 'c -> 'd t
-val wrap4 : ('a -> 'b -> 'c -> 'd -> 'e) -> 'a -> 'b -> 'c -> 'd -> 'e t
-val wrap5 : ('a -> 'b -> 'c -> 'd -> 'e -> 'f) -> 'a -> 'b -> 'c -> 'd -> 'e -> 'f t
-val wrap6 : ('a -> 'b -> 'c -> 'd -> 'e -> 'f -> 'g) -> 'a -> 'b -> 'c -> 'd -> 'e -> 'f -> 'g t
-val wrap7 : ('a -> 'b -> 'c -> 'd -> 'e -> 'f -> 'g -> 'h) -> 'a -> 'b -> 'c -> 'd -> 'e -> 'f -> 'g -> 'h t
-
-(** {2 Multi-threads composition} *)
-
-val choose : 'a t list -> 'a t
-  (** [choose l] behaves as the first thread in [l] to terminate.  If
-      several threads are already terminated, one is chosen at
-      random.
-
-      Note: {!choose} leaves the local values of the current thread
-      unchanged. *)
-
-val nchoose : 'a t list -> 'a list t
-  (** [nchoose l] returns the value of all that have succcessfully
-      terminated. If all threads are sleeping, it waits for at least
-      one to terminates. If one the threads of [l] fails, [nchoose]
-      fails with the same exception.
-
-      Note: {!nchoose} leaves the local values of the current thread
-      unchanged. *)
-
-val nchoose_split : 'a t list -> ('a list * 'a t list) t
-  (** [nchoose_split l] does the same as {!nchoose} but also retrurns
-      the list of threads that have not yet terminated. *)
-
-val join : unit t list -> unit t
-  (** [join l] waits for all threads in [l] to terminate. If one of
-      the threads fails, then [join l] will fails with the same
-      exception as the first one to terminate.
-
-      Note: {!join} leaves the local values of the current thread
-      unchanged. *)
-
-val ( <?> ) : 'a t -> 'a t -> 'a t
-  (** [t <?> t'] is the same as [choose [t; t']] *)
-
-val ( <&> ) : unit t -> unit t -> unit t
-  (** [t <&> t'] is the same as [join [t; t']] *)
-
-val async : (unit -> 'a t) -> unit
-  (** [async f] starts a thread without waiting for the result. If it
-      fails (now or later), the exception is given to
-      {!async_exception_hook}.
-
-      You should use this function if you want to start a thread that
-      might fail and don't care what its return value is, nor when it
-      terminates (for instance, because it is looping). *)
-
-val ignore_result : 'a t -> unit
-(** [ignore_result t] behaves as follows:
-
-    - if [t] has completed with a result, [ignore_result t] does nothing,
-    - if [t] has completed with an exception, [ignore_result t] raises the
-      exception,
-    - if [t] has not completed, [ignore_result t] evaluates to [()] immediately,
-      but if [t] completes later with an exception, it will be given to
-      {!async_exception_hook}.
-
-    Note that this means [ignore_result t] does not wait for [t] to complete. If
-    you need to wait, use [t >>= fun _ -> (* ...after t... *)]. *)
-
-val async_exception_hook : (exn -> unit) ref
-  (** Function called when a asynchronous exception is thrown.
-
-      The default behavior is to print an error message with a
-      backtrace if available and to exit the program.
-
-      The behavior is undefined if this function raise an
-      exception.
-
-      See {{:http://ocsigen.org/lwt/manual/} the manual}
-      for how to enable backtraces.
-  *)
-
 (** {2 Sleeping and resuming} *)
-
-type 'a u
-  (** The type of thread wakeners. *)
-
-val wait : unit -> 'a t * 'a u
-  (** [wait ()] is a pair of a thread which sleeps forever (unless it
-      is resumed by one of the functions [wakeup], [wakeup_exn] below)
-      and the corresponding wakener.  This thread does not block the
-      execution of the remainder of the program (except of course, if
-      another thread tries to wait for its termination). *)
 
 val wakeup : 'a u -> 'a -> unit
   (** [wakeup t e] makes the sleeping thread [t] terminate and return
@@ -300,14 +537,6 @@ val wakeup : 'a u -> 'a -> unit
 val wakeup_exn : 'a u -> exn -> unit
   (** [wakeup_exn t e] makes the sleeping thread [t] fail with the
       exception [e]. *)
-
-val wakeup_later : 'a u -> 'a -> unit
-  (** Same as {!wakeup} but it is not guaranteed that the thread will
-      be woken up immediately. *)
-
-val wakeup_later_exn : 'a u -> exn -> unit
-  (** Same as {!wakeup_exn} but it is not guaranteed that the thread
-      will be woken up immediately. *)
 
 val waiter_of_wakener : 'a u -> 'a t
   (** Returns the thread associated to a wakener. *)
@@ -495,6 +724,49 @@ module Infix : sig
   (** [t <&> t'] is the same as [join [t; t']] *)
 end
 
+
+
+(** {2 Convenience} *)
+
+(** {3 Waiting} *)
+
+val (>>=) : 'a t -> ('a -> 'b t) -> 'b t
+(** [promise >>= after] is the same as [Lwt.bind promise after]. See remarks at
+    {!Lwt.bind}. *)
+
+(** {3 Composition} *)
+
+val ( <?> ) : 'a t -> 'a t -> 'a t
+(** [t <?> t'] is the same as [choose [t; t']]. See {!Lwt.choose}. *)
+
+val ( <&> ) : unit t -> unit t -> unit t
+(** [t <&> t'] is the same as [join [t; t']]. See {!Lwt.join}. *)
+
+(* TODO Permanent anchor for this. *)
+(** {3 Pre-allocated promises} *)
+
+val return_unit : unit t
+(** Like [Lwt.return ()], but does not allocate a new promise. See
+    {!Lwt.return}. *)
+
+val return_none : 'a option t
+(** Like [Lwt.return None], but does not allocate a new promise. See
+    {!Lwt.return}. *)
+
+val return_nil : 'a list t
+(** Like [Lwt.return []], but does not allocate a new promise. See
+    {!Lwt.return}. *)
+
+val return_true : bool t
+(** Like [Lwt.return true], but does not allocate a new promise. See
+    {!Lwt.return}. *)
+
+val return_false : bool t
+(** Like [Lwt.return true], but does not allocate a new promise. See
+    {!Lwt.return}. *)
+
+
+
 (**/**)
 
 (* The functions below are probably not useful for the casual user.
@@ -519,3 +791,93 @@ val backtrace_try_bind : (exn -> exn) -> (unit -> 'a t) -> ('a -> 'b t) -> (exn 
 val backtrace_finalize : (exn -> exn) -> (unit -> 'a t) -> (unit -> unit t) -> 'a t
 
 val abandon_wakeups : unit -> unit
+
+(**/**)
+
+(**/**)
+
+(* Attic: to place... *)
+
+val fail_with : string -> 'a t
+  (** [fail_with msg] is a thread that fails with the exception
+      [Failure msg]. *)
+
+val fail_invalid_arg : string -> 'a t
+  (** [fail_invalid_arg msg] is a thread that fails with the exception
+      [Invalid_argument msg]. *)
+
+val (=<<) : ('a -> 'b t) -> 'a t -> 'b t
+  (** [f =<< t] is [t >>= f] *)
+
+val map : ('a -> 'b) -> 'a t -> 'b t
+  (** [map f m] maps the result of a thread. This is the same as [bind
+      m (fun x -> return (f x))] *)
+
+val (>|=) : 'a t -> ('a -> 'b) -> 'b t
+  (** [m >|= f] is [map f m] *)
+
+val (=|<) : ('a -> 'b) -> 'a t -> 'b t
+  (** [f =|< m] is [map f m] *)
+
+(** {2 Exceptions handling} *)
+
+val try_bind : (unit -> 'a t) -> ('a -> 'b t) -> (exn -> 'b t) -> 'b t
+  (** [try_bind t f g] behaves as [bind (t ()) f] if [t] does not
+      fail.  Otherwise, it behaves as the application of [g] to the
+      exception associated to [t ()]. *)
+
+val wrap : (unit -> 'a) -> 'a t
+  (** [wrap f] calls [f] and transforms the result into an Lwt thread.
+      If [f] raises an exception, it is caught and converted to an Lwt
+      exception.
+
+      This is actually the same as:
+
+      {[
+        try
+          return (f ())
+        with exn ->
+          fail exn
+      ]}
+  *)
+
+val wrap1 : ('a -> 'b) -> 'a -> 'b t
+  (** [wrap1 f x] applies [f] on [x] and returns the result as a
+      thread. If the application of [f] to [x] raise an exception it
+      is catched and a thread is returned.
+
+      Note that you must use {!wrap} instead of {!wrap1} if the
+      evaluation of [x] may raise an exception.
+
+      For example, the following code is incorrect:
+
+      {[
+        wrap1 f (Hashtbl.find table key)
+      ]}
+
+      and should be written as:
+
+      {[
+        wrap (fun () -> f (Hashtbl.find table key))
+      ]}
+  *)
+
+val wrap2 : ('a -> 'b -> 'c) -> 'a -> 'b -> 'c t
+val wrap3 : ('a -> 'b -> 'c -> 'd) -> 'a -> 'b -> 'c -> 'd t
+val wrap4 : ('a -> 'b -> 'c -> 'd -> 'e) -> 'a -> 'b -> 'c -> 'd -> 'e t
+val wrap5 : ('a -> 'b -> 'c -> 'd -> 'e -> 'f) -> 'a -> 'b -> 'c -> 'd -> 'e -> 'f t
+val wrap6 : ('a -> 'b -> 'c -> 'd -> 'e -> 'f -> 'g) -> 'a -> 'b -> 'c -> 'd -> 'e -> 'f -> 'g t
+val wrap7 : ('a -> 'b -> 'c -> 'd -> 'e -> 'f -> 'g -> 'h) -> 'a -> 'b -> 'c -> 'd -> 'e -> 'f -> 'g -> 'h t
+
+val return_some : 'a -> 'a option t
+  (** [return_some x = return (Some x)] *)
+
+val return_ok : 'a -> ('a, _) Result.result t
+  (** [return_ok x] is equivalent to [return (Ok x)].
+      @since 2.6.0 *)
+
+val return_error : 'e -> (_, 'e) Result.result t
+  (** [return_error x] is equivalent to [return (Error x)].
+      @since 2.6.0 *)
+
+(**/**)
