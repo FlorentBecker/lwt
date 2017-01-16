@@ -508,26 +508,6 @@ val async_exception_hook : (exn -> unit) ref
 
 
 
-(** {2 Thread storage} *)
-
-type 'a key
-  (** Type of a key. Keys are used to store local values into
-      threads. *)
-
-val new_key : unit -> 'a key
-  (** [new_key ()] creates a new key. *)
-
-val get : 'a key -> 'a option
-  (** [get key] returns the value associated with [key] in the current
-      thread. *)
-
-val with_value : 'a key -> 'a option -> (unit -> 'b) -> 'b
-  (** [with_value key value f] executes [f] with [value] associated to
-      [key]. [key] is restored to its previous value after [f] terminates.
-
-      This function should not be applied within threads created with
-      {!Lwt_preemptive.detach}. *)
-
 (** {2 Sleeping and resuming} *)
 
 val wakeup : 'a u -> 'a -> unit
@@ -723,6 +703,31 @@ module Infix : sig
   val ( <&> ) : unit t -> unit t -> unit t
   (** [t <&> t'] is the same as [join [t; t']] *)
 end
+
+
+
+(** {2 Promise state}
+
+    It is possible to associate values
+ *)
+
+type 'a key
+  (** Type of a key. Keys are used to store local values into
+      threads. *)
+
+val new_key : unit -> 'a key
+  (** [new_key ()] creates a new key. *)
+
+val get : 'a key -> 'a option
+  (** [get key] returns the value associated with [key] in the current
+      thread. *)
+
+val with_value : 'a key -> 'a option -> (unit -> 'b) -> 'b
+  (** [with_value key value f] executes [f] with [value] associated to
+      [key]. [key] is restored to its previous value after [f] terminates.
+
+      This function should not be applied within threads created with
+      {!Lwt_preemptive.detach}. *)
 
 
 
