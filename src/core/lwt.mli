@@ -706,10 +706,46 @@ end
 
 
 
-(** {2 Promise state}
+(** {2 Storage}
 
-    It is possible to associate values
- *)
+    Lwt is not a threading library. However, a sequence of binds can be {e very}
+    loosely thought of as some kind of "thread":
+
+{[
+let%lwt () = Lwt_unix.sleep 5. in
+let%lwt s = Lwt_io.read stdin in
+let%lwt () = Lwt_io.write stdout s in
+(* ... *)
+]}
+
+    By analogy with thread-local storage, it is possible to associate data
+    values with such a sequence:
+
+{[
+let () =
+  let my_key : int Lwt.key = Lwt.new_key () in
+  let sequence k =
+    Lwt.with_value my_key (Some k) (fun () ->
+      let%lwt () = Lwt_io.printf "Executing sequence with k = %i.\n%!" k in
+      assert (Lwt.get my_key = Some k);
+      let%lwt () = Lwt_unix.sleep 1. in
+      let%lwt () = Lwt_io.printf "Executing sequence with k = %i.\n%!" k in
+      assert (Lwt.get my_key = Some k);
+      Lwt.return_unit)
+  in
+  Lwt_main.run (Lwt.join [sequence 42; sequence 1337])
+(* ocamlfind opt -linkpkg -package lwt.unix -package lwt.ppx example.ml *)
+]}
+
+    In the above example, Lwt preserves the values [42] and [1337] associated to
+    [my_key] in the respective sequences, even though their execution order is
+    interleaved.
+
+    TODO Explain details about when the snapshot happens.
+
+    It is recommended that you avoid using this mechanism whenver possible, and
+    prefer explicit variables that are either in scope, or passed around through
+    promises. *)
 
 type 'a key
   (** Type of a key. Keys are used to store local values into
